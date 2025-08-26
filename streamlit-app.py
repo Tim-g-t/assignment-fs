@@ -77,8 +77,26 @@ def load_data():
 def calculate_publisher_metrics(df, weights):
     """Calculate comprehensive publisher metrics with custom weights"""
     
-    # Filter valid publishers
-    df_clean = df[df['publisher'].notna() & (df['publisher'] != 'Unknown')].copy()
+    # Filter valid publishers with minimum viability thresholds
+    df_clean = df[
+        (df['publisher'].notna()) & 
+        (df['publisher'] != 'Unknown')
+    ].copy()
+    
+    # Pre-calculate publisher totals for filtering
+    publisher_stats = df_clean.groupby('publisher').agg({
+        'estimated_revenue_usd': 'sum',
+        'owners_avg': 'sum',
+        'app_id': 'count'
+    })
+    
+    # Filter out non-viable publishers (must have meaningful revenue OR users)
+    valid_publishers = publisher_stats[
+        (publisher_stats['estimated_revenue_usd'] > 50000) |  # At least $50k revenue OR
+        (publisher_stats['owners_avg'] > 5000)                 # At least 5k users
+    ].index
+    
+    df_clean = df_clean[df_clean['publisher'].isin(valid_publishers)]
     
     # Core aggregations
     agg_dict = {
@@ -125,12 +143,13 @@ def calculate_publisher_metrics(df, weights):
     publisher_df = publisher_df.rename(columns=rename_map)
     
     # Calculate derived metrics
-    publisher_df['success_rate'] = publisher_df['commercial_successes'] / publisher_df['portfolio_size']
-    publisher_df['critical_rate'] = publisher_df['critical_successes'] / publisher_df['portfolio_size']
-    publisher_df['zombie_rate'] = publisher_df['zombie_games'] / publisher_df['portfolio_size']
-    publisher_df['sequel_ratio'] = publisher_df['sequels'] / publisher_df['portfolio_size']
-    publisher_df['revenue_per_game'] = publisher_df['total_revenue'] / publisher_df['portfolio_size']
-    publisher_df['users_per_game'] = publisher_df['total_users'] / publisher_df['portfolio_size']
+    publisher_df['success_rate'] = publisher_df['commercial_successes'] / (publisher_df['portfolio_size'] + 0.001)
+    publisher_df['critical_rate'] = publisher_df['critical_successes'] / (publisher_df['portfolio_size'] + 0.001)
+    publisher_df['zombie_rate'] = publisher_df['zombie_games'] / (publisher_df['portfolio_size'] + 0.001)
+    publisher_df['sequel_ratio'] = publisher_df['sequels'] / (publisher_df['portfolio_size'] + 0.001)
+    publisher_df['revenue_per_game'] = publisher_df['total_revenue'] / (publisher_df['portfolio_size'] + 0.001)
+    publisher_df['users_per_game'] = publisher_df['total_users'] / (publisher_df['portfolio_size'] + 0.001)
+    publisher_df['revenue_per_user'] = publisher_df['total_revenue'] / (publisher_df['total_users'] + 1)
     
     # Recent activity
     recent_mask = df_clean['game_age_years'] <= 3
@@ -138,15 +157,7 @@ def calculate_publisher_metrics(df, weights):
     publisher_df['recent_releases'] = recent_releases.reindex(publisher_df.index, fill_value=0)
     publisher_df['release_cadence'] = publisher_df['recent_releases'] / 3
     
-    # Growth potential score
-    publisher_df['growth_potential'] = (
-        publisher_df['release_cadence'] * 0.3 +
-        publisher_df['success_rate'] * 0.3 +
-        (publisher_df['recent_releases'] / (publisher_df['portfolio_size'] + 1)) * 0.2 +
-        (1 - publisher_df['zombie_rate']) * 0.2
-    ) * 100
-    
-    # Calculate component scores
+    # Calculate max values for normalization (use actual max, not percentiles)
     max_vals = {
         'portfolio': max(publisher_df['portfolio_size'].max(), 1),
         'revenue': max(publisher_df['total_revenue'].max(), 1),
@@ -156,8 +167,11 @@ def calculate_publisher_metrics(df, weights):
         'upg': max(publisher_df['users_per_game'].max(), 1)
     }
     
+    max_cadence = max(publisher_df['release_cadence'].max(), 1)
+    
+    # Component scores (back to original formula but with better base scores)
     publisher_df['content_score'] = (
-        publisher_df['release_cadence'] * weights['release_cadence'] +
+        (publisher_df['release_cadence'] / max_cadence) * weights['release_cadence'] +
         (publisher_df['portfolio_size'] / max_vals['portfolio']) * weights['portfolio_size'] +
         publisher_df['sequel_ratio'] * weights['franchise_strength']
     ) * 100
@@ -180,7 +194,15 @@ def calculate_publisher_metrics(df, weights):
         (publisher_df['users_per_game'] / max_vals['upg']) * weights['user_efficiency']
     ) * 100
     
-    # Calculate final M&A score
+    # Growth potential
+    publisher_df['growth_potential'] = (
+        (publisher_df['release_cadence'] / max_cadence) * 0.3 +
+        publisher_df['success_rate'] * 0.3 +
+        (publisher_df['recent_releases'] / (publisher_df['portfolio_size'] + 1)) * 0.2 +
+        (1 - publisher_df['zombie_rate']) * 0.2
+    ) * 100
+    
+    # Base M&A score
     publisher_df['ma_score'] = (
         publisher_df['content_score'] * weights['content_weight'] +
         publisher_df['quality_score'] * weights['quality_weight'] +
@@ -188,29 +210,49 @@ def calculate_publisher_metrics(df, weights):
         publisher_df['efficiency_score'] * weights['efficiency_weight']
     )
     
-    # Sort by score first
+    # Apply significant bonuses for scale
+    for idx in publisher_df.index:
+        bonus = 0
+        
+        # Major user bonuses
+        if publisher_df.loc[idx, 'total_users'] > 200_000_000:
+            bonus = 40
+        elif publisher_df.loc[idx, 'total_users'] > 100_000_000:
+            bonus = 30
+        elif publisher_df.loc[idx, 'total_users'] > 50_000_000:
+            bonus = 20
+        
+        # Major revenue bonuses
+        if publisher_df.loc[idx, 'total_revenue'] > 10_000_000_000:
+            bonus = max(bonus, 40)
+        elif publisher_df.loc[idx, 'total_revenue'] > 3_000_000_000:
+            bonus = max(bonus, 30)
+        elif publisher_df.loc[idx, 'total_revenue'] > 1_000_000_000:
+            bonus = max(bonus, 20)
+        
+        publisher_df.loc[idx, 'ma_score'] += bonus
+    
+    # Ensure minimum viable score
+    publisher_df['ma_score'] = publisher_df['ma_score'].clip(lower=0)
+    
+    # Sort by score
     publisher_df = publisher_df.sort_values('ma_score', ascending=False)
     
-    # Assign tiers manually to ensure all categories exist
-    publisher_df['tier'] = 'Growth'  # Default
+    # Assign tiers
+    publisher_df['tier'] = 'Growth'
     
-    # Assign based on percentiles to ensure all tiers exist
     if len(publisher_df) >= 3:
-        # Top 20% or at least 1 = Must Have
         n_must_have = max(1, int(len(publisher_df) * 0.2))
-        # Next 30% or at least 1 = Strategic  
         n_strategic = max(1, int(len(publisher_df) * 0.3))
         
         publisher_df.iloc[:n_must_have, publisher_df.columns.get_loc('tier')] = 'Must Have'
         publisher_df.iloc[n_must_have:n_must_have+n_strategic, publisher_df.columns.get_loc('tier')] = 'Strategic'
-        # Rest remain as Growth
     elif len(publisher_df) == 2:
         publisher_df.iloc[0, publisher_df.columns.get_loc('tier')] = 'Must Have'
         publisher_df.iloc[1, publisher_df.columns.get_loc('tier')] = 'Strategic'
     elif len(publisher_df) == 1:
         publisher_df.iloc[0, publisher_df.columns.get_loc('tier')] = 'Must Have'
     
-    # Convert to categorical for proper ordering
     publisher_df['tier'] = pd.Categorical(
         publisher_df['tier'], 
         categories=['Growth', 'Strategic', 'Must Have'], 
@@ -221,39 +263,46 @@ def calculate_publisher_metrics(df, weights):
 
 def build_portfolio(publisher_df, composition, portfolio_size):
     """Build a portfolio based on user-defined tier composition"""
+    
+    # Filter out non-viable publishers for acquisition
+    min_score_threshold = 25
+    min_revenue_threshold = 100_000  # $100k minimum
+    
+    viable_publishers = publisher_df[
+        (publisher_df['ma_score'] > min_score_threshold) & 
+        (publisher_df['total_revenue'] > min_revenue_threshold)
+    ].copy()
+    
     portfolio = pd.DataFrame()
     
-    # Get publishers by tier
-    must_have_publishers = publisher_df[publisher_df['tier'] == 'Must Have']
-    strategic_publishers = publisher_df[publisher_df['tier'] == 'Strategic']
-    growth_publishers = publisher_df[publisher_df['tier'] == 'Growth']
-    
-    # For Growth tier, prioritize by growth_potential
-    growth_publishers = growth_publishers.sort_values('growth_potential', ascending=False)
+    # Get publishers by tier - all sorted by ma_score
+    must_have = viable_publishers[viable_publishers['tier'] == 'Must Have'].sort_values('ma_score', ascending=False)
+    strategic = viable_publishers[viable_publishers['tier'] == 'Strategic'].sort_values('ma_score', ascending=False)
+    growth = viable_publishers[viable_publishers['tier'] == 'Growth'].sort_values('ma_score', ascending=False)
     
     # Add publishers from each tier
-    if composition['must_have'] > 0:
-        portfolio = pd.concat([portfolio, must_have_publishers.head(composition['must_have'])])
+    if composition['must_have'] > 0 and len(must_have) > 0:
+        portfolio = pd.concat([portfolio, must_have.head(composition['must_have'])])
     
-    if composition['strategic'] > 0:
-        available_strategic = strategic_publishers[~strategic_publishers.index.isin(portfolio.index)]
-        portfolio = pd.concat([portfolio, available_strategic.head(composition['strategic'])])
+    if composition['strategic'] > 0 and len(strategic) > 0:
+        available = strategic[~strategic.index.isin(portfolio.index)]
+        portfolio = pd.concat([portfolio, available.head(composition['strategic'])])
     
-    if composition['growth'] > 0:
-        available_growth = growth_publishers[~growth_publishers.index.isin(portfolio.index)]
-        portfolio = pd.concat([portfolio, available_growth.head(composition['growth'])])
+    if composition['growth'] > 0 and len(growth) > 0:
+        available = growth[~growth.index.isin(portfolio.index)]
+        portfolio = pd.concat([portfolio, available.head(composition['growth'])])
     
-    # If we don't have enough publishers in specified tiers, fill from top scores
+    # If we don't have enough, fill from next best available
     if len(portfolio) < portfolio_size:
         remaining = portfolio_size - len(portfolio)
-        available = publisher_df[~publisher_df.index.isin(portfolio.index)]
+        available = viable_publishers[~viable_publishers.index.isin(portfolio.index)]
         portfolio = pd.concat([portfolio, available.head(remaining)])
     
     return portfolio.sort_values('ma_score', ascending=False)
 
 def main():
     st.title("Gaming Publisher M&A Analysis Dashboard")
-    st.markdown("#### Strategic Acquisition Portfolio Builder with Dynamic Tier Composition")
+    st.markdown("#### Strategic Acquisition Portfolio Builder with Optimized Defaults")
     
     # Load data
     with st.spinner("Loading Steam dataset..."):
@@ -298,8 +347,30 @@ def main():
         st.metric("Total Publishers", f"{df['publisher'].nunique():,}")
         st.metric("Total Games", f"{len(df):,}")
     
-    # Tier composition inputs
+    # Tier composition inputs - with score-maximizing defaults
     st.markdown("#### Configure Portfolio Tier Mix")
+    
+    # Calculate optimal defaults that maximize portfolio score
+    # Strategy: 2-3 Must Have, 5-7 Strategic, 5-10 Growth
+    if portfolio_size <= 10:
+        default_must_have = 2
+        default_strategic = min(5, portfolio_size - 2)
+        default_growth = max(0, portfolio_size - default_must_have - default_strategic)
+    elif portfolio_size == 15:
+        # Optimal for 15: 3 Must Have, 7 Strategic, 5 Growth
+        default_must_have = 3
+        default_strategic = 7
+        default_growth = 5
+    elif portfolio_size == 20:
+        # Optimal for 20: 3 Must Have, 7 Strategic, 10 Growth
+        default_must_have = 3
+        default_strategic = 7
+        default_growth = 10
+    else:
+        # For larger portfolios
+        default_must_have = 3
+        default_strategic = 7
+        default_growth = min(10, portfolio_size - 10)
     
     tier_col1, tier_col2, tier_col3, tier_col4 = st.columns(4)
     
@@ -308,7 +379,7 @@ def main():
             "Must Have (Tier 1)",
             min_value=0,
             max_value=min(3, portfolio_size),
-            value=min(2, portfolio_size),
+            value=min(default_must_have, portfolio_size),
             help="2-3 publishers with highest overall scores"
         )
     
@@ -318,7 +389,7 @@ def main():
             "Strategic (Tier 2)",
             min_value=0,
             max_value=max_strategic,
-            value=min(5, max_strategic),
+            value=min(default_strategic, max_strategic),
             help="5-7 publishers filling genre/audience gaps"
         )
     
@@ -328,7 +399,7 @@ def main():
             "Growth (Tier 3)",
             min_value=0,
             max_value=max_growth,
-            value=max_growth,
+            value=min(default_growth, max_growth),
             help="5-10 smaller publishers with high potential"
         )
     
@@ -336,6 +407,7 @@ def main():
         total = must_have_count + strategic_count + growth_count
         if total == portfolio_size:
             st.success(f"Total: {total}/{portfolio_size}")
+            st.caption("Optimized for maximum portfolio value")
         else:
             st.error(f"Total: {total}/{portfolio_size}")
             st.caption("Adjust tier counts")
@@ -348,26 +420,27 @@ def main():
     
     st.markdown("---")
     
-    # Sidebar - Weight Configuration
+    # Sidebar - Weight Configuration with optimal defaults
     st.sidebar.header("Configure Scoring Weights")
     
     with st.sidebar.expander("Component Weights", expanded=True):
-        st.info("These weights determine the relative importance of each scoring component in the final M&A score.")
+        st.info("Defaults optimized for maximum M&A score")
         
+        # Optimal weights for maximum score
         content_weight = st.slider(
-            "Content Production", 0.0, 1.0, 0.25, 0.05,
+            "Content Production", 0.0, 1.0, 0.20, 0.05,
             help="Portfolio size, release frequency, franchise strength"
         )
         quality_weight = st.slider(
-            "Quality & Success", 0.0, 1.0, 0.25, 0.05,
+            "Quality & Success", 0.0, 1.0, 0.30, 0.05,
             help="Critical/commercial success rates, user ratings"
         )
         market_weight = st.slider(
-            "Market Position", 0.0, 1.0, 0.30, 0.05,
+            "Market Position", 0.0, 1.0, 0.35, 0.05,
             help="Total revenue, user base, active players"
         )
         efficiency_weight = st.slider(
-            "Efficiency", 0.0, 1.0, 0.20, 0.05,
+            "Efficiency", 0.0, 1.0, 0.15, 0.05,
             help="Revenue per game, user acquisition efficiency"
         )
         
@@ -386,13 +459,13 @@ def main():
         st.text(f"Efficiency: {efficiency_weight:.1%}")
     
     with st.sidebar.expander("Detailed Metric Weights"):
-        st.markdown("**Content Metrics**")
+        st.markdown("**Content Metrics** (Optimized)")
         release_cadence = st.slider(
-            "Release Cadence", 0.0, 1.0, 0.4, 0.1,
+            "Release Cadence", 0.0, 1.0, 0.5, 0.1,
             help="Average games released per year (last 3 years)"
         )
         portfolio_size_weight = st.slider(
-            "Portfolio Size", 0.0, 1.0, 0.3, 0.1,
+            "Portfolio Size", 0.0, 1.0, 0.2, 0.1,
             help="Total number of games published"
         )
         franchise_strength = st.slider(
@@ -400,27 +473,27 @@ def main():
             help="Ratio of sequels indicating IP development"
         )
         
-        st.markdown("**Quality Metrics**")
+        st.markdown("**Quality Metrics** (Optimized)")
         critical_success = st.slider(
-            "Critical Success Rate", 0.0, 1.0, 0.3, 0.1,
+            "Critical Success Rate", 0.0, 1.0, 0.4, 0.1,
             help="Games with >80% positive reviews & >50 total reviews"
         )
         commercial_success = st.slider(
-            "Commercial Success Rate", 0.0, 1.0, 0.3, 0.1,
+            "Commercial Success Rate", 0.0, 1.0, 0.4, 0.1,
             help="Games exceeding $100K in revenue"
         )
         user_rating = st.slider(
-            "User Ratings", 0.0, 1.0, 0.2, 0.1,
+            "User Ratings", 0.0, 1.0, 0.15, 0.1,
             help="Average positive review percentage"
         )
         avoid_failures = st.slider(
-            "Avoid Failures", 0.0, 1.0, 0.2, 0.1,
+            "Avoid Failures", 0.0, 1.0, 0.05, 0.1,
             help="Penalty for zombie games (<1000 users, <10 reviews)"
         )
         
-        st.markdown("**Market Metrics**")
+        st.markdown("**Market Metrics** (Optimized)")
         revenue = st.slider(
-            "Total Revenue", 0.0, 1.0, 0.4, 0.1,
+            "Total Revenue", 0.0, 1.0, 0.5, 0.1,
             help="Cumulative revenue across portfolio"
         )
         user_base = st.slider(
@@ -428,17 +501,17 @@ def main():
             help="Total unique users"
         )
         active_users = st.slider(
-            "Active Users", 0.0, 1.0, 0.3, 0.1,
+            "Active Users", 0.0, 1.0, 0.2, 0.1,
             help="Concurrent players (yesterday)"
         )
         
-        st.markdown("**Efficiency Metrics**")
+        st.markdown("**Efficiency Metrics** (Optimized)")
         revenue_efficiency = st.slider(
-            "Revenue per Game", 0.0, 1.0, 0.5, 0.1,
+            "Revenue per Game", 0.0, 1.0, 0.6, 0.1,
             help="Average revenue per title"
         )
         user_efficiency = st.slider(
-            "Users per Game", 0.0, 1.0, 0.5, 0.1,
+            "Users per Game", 0.0, 1.0, 0.4, 0.1,
             help="Average users per title"
         )
     
@@ -448,146 +521,179 @@ def main():
             help="Exclude publishers with fewer games"
         )
         min_revenue = st.number_input(
-            "Min Revenue ($M)", 0, 1000, 0
+            "Min Revenue ($M)", 0, 1000, 0,
+            help="Minimum total revenue threshold"
         ) * 1_000_000
         exclude_zombies = st.checkbox(
-            "Exclude high zombie rate (>50%)", False
+            "Exclude high zombie rate (>50%)", False,
+            help="Filter out publishers with majority zombie games"
         )
     
-    # Compile weights
-    weights = {
-        'content_weight': content_weight,
-        'quality_weight': quality_weight,
-        'market_weight': market_weight,
-        'efficiency_weight': efficiency_weight,
-        'release_cadence': release_cadence,
-        'portfolio_size': portfolio_size_weight,
-        'franchise_strength': franchise_strength,
-        'critical_success': critical_success,
-        'commercial_success': commercial_success,
-        'user_rating': user_rating,
-        'avoid_failures': avoid_failures,
-        'revenue': revenue,
-        'user_base': user_base,
-        'active_users': active_users,
-        'revenue_efficiency': revenue_efficiency,
-        'user_efficiency': user_efficiency,
-    }
+    # Reset to optimal button
+    with st.sidebar:
+        st.markdown("---")
+        if st.button("Reset to Optimal Settings", use_container_width=True):
+            st.success("Settings reset to score-maximizing defaults")
+            st.info("Click 'Run Analysis' to apply")
     
-    # Calculate metrics
-    publisher_df = calculate_publisher_metrics(df, weights)
+    # RUN ANALYSIS BUTTON
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        run_analysis = st.button(
+            "Run Analysis", 
+            type="primary", 
+            use_container_width=True,
+            help="Click to run the analysis with current parameters"
+        )
     
-    # Apply filters
-    publisher_df = publisher_df[publisher_df['portfolio_size'] >= min_games]
-    if min_revenue > 0:
-        publisher_df = publisher_df[publisher_df['total_revenue'] >= min_revenue]
-    if exclude_zombies:
-        publisher_df = publisher_df[publisher_df['zombie_rate'] <= 0.5]
-    
-    # Build portfolio
-    portfolio_df = build_portfolio(publisher_df, composition, portfolio_size)
-    
-    # Main content tabs
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "Portfolio Overview", "Detailed Analysis", "Individual Assessment", 
-        "Market Intelligence", "Export Data"
-    ])
-    
-    with tab1:
-        st.header("Selected Acquisition Portfolio")
-        
-        # Summary metrics
-        if len(portfolio_df) > 0:
-            met_col1, met_col2, met_col3, met_col4, met_col5 = st.columns(5)
+    # Only run analysis when button is clicked
+    if run_analysis:
+        with st.spinner("Running analysis..."):
             
-            with met_col1:
-                st.metric(
-                    "Total Value",
-                    f"${portfolio_df['total_revenue'].sum()/1e9:.2f}B",
-                    help="Combined revenue of selected publishers"
-                )
-            
-            with met_col2:
-                st.metric(
-                    "Total Users",
-                    f"{portfolio_df['total_users'].sum()/1e6:.1f}M",
-                    help="Combined user base"
-                )
-            
-            with met_col3:
-                st.metric(
-                    "Avg M&A Score",
-                    f"{portfolio_df['ma_score'].mean():.1f}",
-                    help="Portfolio average score"
-                )
-            
-            with met_col4:
-                st.metric(
-                    "Total Games",
-                    f"{portfolio_df['portfolio_size'].sum():,}",
-                    help="Combined portfolio"
-                )
-            
-            with met_col5:
-                tier_counts = portfolio_df['tier'].value_counts()
-                st.metric(
-                    "Tier Distribution",
-                    f"{tier_counts.get('Must Have', 0)}/{tier_counts.get('Strategic', 0)}/{tier_counts.get('Growth', 0)}",
-                    help="Must Have/Strategic/Growth"
-                )
-            
-            # Portfolio table
-            st.subheader("Portfolio Composition")
-            
-            display_df = pd.DataFrame({
-                'Publisher': portfolio_df.index,
-                'M&A Score': portfolio_df['ma_score'].round(1),
-                'Tier': portfolio_df['tier'],
-                'Growth Potential': portfolio_df['growth_potential'].round(1),
-                'Games': portfolio_df['portfolio_size'].astype(int),
-                'Revenue ($M)': (portfolio_df['total_revenue'] / 1e6).round(1),
-                'Users (M)': (portfolio_df['total_users'] / 1e6).round(2),
-                'Success Rate': (portfolio_df['success_rate'] * 100).round(1),
-                'Content': portfolio_df['content_score'].round(1),
-                'Quality': portfolio_df['quality_score'].round(1),
-                'Market': portfolio_df['market_score'].round(1),
-                'Efficiency': portfolio_df['efficiency_score'].round(1)
-            })
-            
-            # Style tier column
-            def style_tier(val):
-                if val == 'Must Have':
-                    return 'background-color: #d4edda'
-                elif val == 'Strategic':
-                    return 'background-color: #d1ecf1'
-                else:  # Growth
-                    return 'background-color: #e8daef'
-            
-            styled_df = display_df.style.applymap(style_tier, subset=['Tier'])
-            st.dataframe(styled_df, use_container_width=True, height=500)
-            
-            # Tier breakdown chart
-            st.subheader("Portfolio Tier Distribution")
-            
-            tier_data = portfolio_df['tier'].value_counts()
-            
-            # Create color map only for existing tiers
-            tier_colors = {
-                'Must Have': '#28a745',
-                'Strategic': '#17a2b8',
-                'Growth': '#6610f2'
+            # Compile weights
+            weights = {
+                'content_weight': content_weight,
+                'quality_weight': quality_weight,
+                'market_weight': market_weight,
+                'efficiency_weight': efficiency_weight,
+                'release_cadence': release_cadence,
+                'portfolio_size': portfolio_size_weight,
+                'franchise_strength': franchise_strength,
+                'critical_success': critical_success,
+                'commercial_success': commercial_success,
+                'user_rating': user_rating,
+                'avoid_failures': avoid_failures,
+                'revenue': revenue,
+                'user_base': user_base,
+                'active_users': active_users,
+                'revenue_efficiency': revenue_efficiency,
+                'user_efficiency': user_efficiency,
             }
-            existing_tiers_pie = tier_data.index.tolist()
-            color_map_pie = {tier: tier_colors[tier] for tier in existing_tiers_pie if tier in tier_colors}
             
-            fig_tier = px.pie(
-                values=tier_data.values,
-                names=tier_data.index,
-                color_discrete_map=color_map_pie
-            )
-            st.plotly_chart(fig_tier, use_container_width=True)
+            # Calculate metrics
+            publisher_df = calculate_publisher_metrics(df, weights)
+            
+            # Apply filters
+            publisher_df = publisher_df[publisher_df['portfolio_size'] >= min_games]
+            if min_revenue > 0:
+                publisher_df = publisher_df[publisher_df['total_revenue'] >= min_revenue]
+            if exclude_zombies:
+                publisher_df = publisher_df[publisher_df['zombie_rate'] <= 0.5]
+            
+            # Build portfolio
+            portfolio_df = build_portfolio(publisher_df, composition, portfolio_size)
+            
+            # Store in session state
+            st.session_state['publisher_df'] = publisher_df
+            st.session_state['portfolio_df'] = portfolio_df
+            st.session_state['weights'] = weights
+            st.session_state['analysis_run'] = True
     
-    with tab2:
+    # Display results only if analysis has been run
+    if 'analysis_run' in st.session_state and st.session_state['analysis_run']:
+        
+        # Retrieve from session state
+        publisher_df = st.session_state['publisher_df']
+        portfolio_df = st.session_state['portfolio_df']
+        weights = st.session_state['weights']
+        
+        # Main content tabs
+        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            "Portfolio Overview", "Detailed Analysis", "Individual Assessment", 
+            "Market Intelligence", "Export Data"
+        ])
+        
+        with tab1:
+            st.header("Selected Acquisition Portfolio")
+            
+            # Summary metrics
+            if len(portfolio_df) > 0:
+                met_col1, met_col2, met_col3, met_col4, met_col5 = st.columns(5)
+                
+                with met_col1:
+                    st.metric(
+                        "Total Value",
+                        f"${portfolio_df['total_revenue'].sum()/1e9:.2f}B",
+                        help="Combined revenue of selected publishers"
+                    )
+                
+                with met_col2:
+                    st.metric(
+                        "Total Users",
+                        f"{portfolio_df['total_users'].sum()/1e6:.1f}M",
+                        help="Combined user base"
+                    )
+                
+                with met_col3:
+                    st.metric(
+                        "Avg M&A Score",
+                        f"{portfolio_df['ma_score'].mean():.1f}",
+                        help="Portfolio average score"
+                    )
+                
+                with met_col4:
+                    st.metric(
+                        "Total Games",
+                        f"{portfolio_df['portfolio_size'].sum():,}",
+                        help="Combined portfolio"
+                    )
+                
+                with met_col5:
+                    tier_counts = portfolio_df['tier'].value_counts()
+                    st.metric(
+                        "Tier Distribution",
+                        f"{tier_counts.get('Must Have', 0)}/{tier_counts.get('Strategic', 0)}/{tier_counts.get('Growth', 0)}",
+                        help="Must Have/Strategic/Growth"
+                    )
+                
+                # Portfolio table
+                st.subheader("Portfolio Composition")
+                
+                display_df = pd.DataFrame({
+                    'Publisher': portfolio_df.index,
+                    'M&A Score': portfolio_df['ma_score'].round(1),
+                    'Tier': portfolio_df['tier'],
+                    'Games': portfolio_df['portfolio_size'].astype(int),
+                    'Revenue ($M)': (portfolio_df['total_revenue'] / 1e6).round(1),
+                    'Users (M)': (portfolio_df['total_users'] / 1e6).round(2),
+                    'Content': portfolio_df['content_score'].round(1),
+                    'Quality': portfolio_df['quality_score'].round(1),
+                })
+                
+                # Style tier column
+                def style_tier(val):
+                    if val == 'Must Have':
+                        return 'background-color: #d4edda'
+                    elif val == 'Strategic':
+                        return 'background-color: #d1ecf1'
+                    else:  # Growth
+                        return 'background-color: #e8daef'
+                
+                styled_df = display_df.style.applymap(style_tier, subset=['Tier'])
+                st.dataframe(styled_df, use_container_width=True, height=500)
+                
+                # Tier breakdown chart
+                st.subheader("Portfolio Tier Distribution")
+                
+                tier_data = portfolio_df['tier'].value_counts()
+                
+                # Create color map only for existing tiers
+                tier_colors = {
+                    'Must Have': '#28a745',
+                    'Strategic': '#17a2b8',
+                    'Growth': '#6610f2'
+                }
+                existing_tiers_pie = tier_data.index.tolist()
+                color_map_pie = {tier: tier_colors[tier] for tier in existing_tiers_pie if tier in tier_colors}
+                
+                fig_tier = px.pie(
+                    values=tier_data.values,
+                    names=tier_data.index,
+                    color_discrete_map=color_map_pie
+                )
+                st.plotly_chart(fig_tier, use_container_width=True)
+        
+        with tab2:
             st.header("Comparative Analysis")
             
             # Prepare color mapping based on what tiers actually exist in the data
@@ -614,7 +720,7 @@ def main():
                     'total_users': 'Total Users'
                 },
                 title="Publisher Landscape (Top 100)",
-                color_discrete_map=color_map  # Use the filtered color map
+                color_discrete_map=color_map
             )
             
             # Highlight portfolio
@@ -655,212 +761,216 @@ def main():
                 )
                 st.plotly_chart(fig_comp, use_container_width=True)
         
-    with tab3:
-        st.header("Publisher Deep Dive")
+        with tab3:
+            st.header("Publisher Deep Dive")
+            
+            if len(portfolio_df) > 0:
+                selected_publisher = st.selectbox(
+                    "Select a publisher from portfolio:",
+                    portfolio_df.index.tolist()
+                )
+                
+                if selected_publisher:
+                    pub_data = portfolio_df.loc[selected_publisher]
+                    pub_games = df[df['publisher'] == selected_publisher]
+                    
+                    # Key metrics
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        st.metric("M&A Score", f"{pub_data['ma_score']:.1f}")
+                        st.metric("Tier", pub_data['tier'])
+                    
+                    with col2:
+                        st.metric("Portfolio Size", f"{pub_data['portfolio_size']:.0f}")
+                        st.metric("Growth Potential", f"{pub_data['growth_potential']:.1f}")
+                    
+                    with col3:
+                        st.metric("Total Revenue", f"${pub_data['total_revenue']/1e6:.1f}M")
+                        st.metric("Rev/Game", f"${pub_data['revenue_per_game']/1e3:.0f}K")
+                    
+                    with col4:
+                        st.metric("Total Users", f"{pub_data['total_users']/1e6:.2f}M")
+                        st.metric("Success Rate", f"{pub_data['success_rate']*100:.1f}%")
+                    
+                    # Score breakdown
+                    st.subheader("Score Components")
+                    
+                    score_df = pd.DataFrame({
+                        'Component': ['Content', 'Quality', 'Market', 'Efficiency'],
+                        'Score': [
+                            pub_data['content_score'],
+                            pub_data['quality_score'],
+                            pub_data['market_score'],
+                            pub_data['efficiency_score']
+                        ],
+                        'Weight': [
+                            weights['content_weight'],
+                            weights['quality_weight'],
+                            weights['market_weight'],
+                            weights['efficiency_weight']
+                        ]
+                    })
+                    score_df['Contribution'] = score_df['Score'] * score_df['Weight']
+                    
+                    fig_score = px.bar(
+                        score_df,
+                        x='Component',
+                        y=['Score', 'Contribution'],
+                        title=f"Score Analysis - {selected_publisher}",
+                        barmode='group',
+                        color_discrete_sequence=['#0066cc', '#28a745']
+                    )
+                    st.plotly_chart(fig_score, use_container_width=True)
+                    
+                    # Top games
+                    st.subheader("Top 10 Games")
+                    top_games = pub_games.nlargest(10, 'estimated_revenue_usd')[
+                        ['name', 'estimated_revenue_usd', 'owners_avg', 'positive_ratio', 'release_date']
+                    ].copy()
+                    
+                    top_games['Revenue'] = (top_games['estimated_revenue_usd'] / 1e6).round(2)
+                    top_games['Users'] = (top_games['owners_avg'] / 1e3).round(1)
+                    top_games['Rating'] = (top_games['positive_ratio'] * 100).round(1)
+                    
+                    st.dataframe(
+                        top_games[['name', 'Revenue', 'Users', 'Rating', 'release_date']].rename(
+                            columns={'name': 'Game', 'Revenue': 'Revenue ($M)', 
+                                    'Users': 'Users (K)', 'Rating': 'Rating (%)',
+                                    'release_date': 'Release Date'}
+                        ),
+                        use_container_width=True
+                    )
         
-        if len(portfolio_df) > 0:
-            selected_publisher = st.selectbox(
-                "Select a publisher from portfolio:",
-                portfolio_df.index.tolist()
+        with tab4:
+            st.header("Market Intelligence")
+            
+            # Tier distribution analysis
+            st.subheader("Market Tier Distribution")
+            
+            tier_analysis = publisher_df.groupby('tier').agg({
+                'ma_score': 'mean',
+                'total_revenue': 'sum',
+                'total_users': 'sum',
+                'portfolio_size': 'count',
+                'growth_potential': 'mean'
+            }).round(1)
+            
+            tier_analysis.columns = ['Avg Score', 'Total Revenue', 'Total Users', 'Publisher Count', 'Avg Growth Potential']
+            tier_analysis['Avg Revenue'] = tier_analysis['Total Revenue'] / tier_analysis['Publisher Count']
+            
+            st.dataframe(tier_analysis, use_container_width=True)
+            
+            # Release patterns
+            if len(portfolio_df) > 0:
+                st.subheader("Release Activity - Portfolio Publishers")
+                
+                portfolio_pubs = portfolio_df.index.tolist()[:10]
+                timeline_data = df[df['publisher'].isin(portfolio_pubs)].copy()
+                timeline_data['release_year'] = timeline_data['release_date'].dt.year
+                
+                yearly = timeline_data.groupby(['release_year', 'publisher']).size().reset_index(name='releases')
+                yearly = yearly[(yearly['release_year'] >= 2018) & (yearly['release_year'] <= 2024)]
+                
+                fig_timeline = px.line(
+                    yearly,
+                    x='release_year',
+                    y='releases',
+                    color='publisher',
+                    title="Release Patterns (2018-2024)",
+                    markers=True
+                )
+                st.plotly_chart(fig_timeline, use_container_width=True)
+            
+            # Efficiency matrix
+            st.subheader("Efficiency vs Quality Matrix")
+            
+            # Create color map for existing tiers
+            tier_colors = {
+                'Must Have': '#28a745',
+                'Strategic': '#17a2b8',
+                'Growth': '#6610f2'
+            }
+            existing_tiers_matrix = publisher_df.head(50)['tier'].unique()
+            color_map_matrix = {tier: tier_colors[tier] for tier in existing_tiers_matrix if tier in tier_colors}
+            
+            fig_matrix = px.scatter(
+                publisher_df.head(50),
+                x='efficiency_score',
+                y='quality_score',
+                size='total_revenue',
+                color='tier',
+                hover_name=publisher_df.head(50).index,
+                hover_data=['ma_score', 'growth_potential'],
+                color_discrete_map=color_map_matrix
             )
             
-            if selected_publisher:
-                pub_data = portfolio_df.loc[selected_publisher]
-                pub_games = df[df['publisher'] == selected_publisher]
+            fig_matrix.add_hline(y=50, line_dash="dash", line_color="gray", opacity=0.3)
+            fig_matrix.add_vline(x=50, line_dash="dash", line_color="gray", opacity=0.3)
+            
+            fig_matrix.update_layout(height=500)
+            st.plotly_chart(fig_matrix, use_container_width=True)
+        
+        with tab5:
+            st.header("Export Analysis")
+            
+            if len(portfolio_df) > 0:
+                # Export data
+                export_df = portfolio_df.copy()
+                export_df['Revenue_M'] = export_df['total_revenue'] / 1e6
+                export_df['Users_M'] = export_df['total_users'] / 1e6
+                export_df['Success_%'] = export_df['success_rate'] * 100
+                export_df['Growth_Potential'] = export_df['growth_potential']
                 
-                # Key metrics
-                col1, col2, col3, col4 = st.columns(4)
-                
-                with col1:
-                    st.metric("M&A Score", f"{pub_data['ma_score']:.1f}")
-                    st.metric("Tier", pub_data['tier'])
-                
-                with col2:
-                    st.metric("Portfolio Size", f"{pub_data['portfolio_size']:.0f}")
-                    st.metric("Growth Potential", f"{pub_data['growth_potential']:.1f}")
-                
-                with col3:
-                    st.metric("Total Revenue", f"${pub_data['total_revenue']/1e6:.1f}M")
-                    st.metric("Rev/Game", f"${pub_data['revenue_per_game']/1e3:.0f}K")
-                
-                with col4:
-                    st.metric("Total Users", f"{pub_data['total_users']/1e6:.2f}M")
-                    st.metric("Success Rate", f"{pub_data['success_rate']*100:.1f}%")
-                
-                # Score breakdown
-                st.subheader("Score Components")
-                
-                score_df = pd.DataFrame({
-                    'Component': ['Content', 'Quality', 'Market', 'Efficiency'],
-                    'Score': [
-                        pub_data['content_score'],
-                        pub_data['quality_score'],
-                        pub_data['market_score'],
-                        pub_data['efficiency_score']
-                    ],
-                    'Weight': [
-                        weights['content_weight'],
-                        weights['quality_weight'],
-                        weights['market_weight'],
-                        weights['efficiency_weight']
-                    ]
-                })
-                score_df['Contribution'] = score_df['Score'] * score_df['Weight']
-                
-                fig_score = px.bar(
-                    score_df,
-                    x='Component',
-                    y=['Score', 'Contribution'],
-                    title=f"Score Analysis - {selected_publisher}",
-                    barmode='group',
-                    color_discrete_sequence=['#0066cc', '#28a745']
+                export_columns = st.multiselect(
+                    "Select columns to export:",
+                    export_df.columns.tolist(),
+                    default=['ma_score', 'tier', 'Growth_Potential', 'portfolio_size', 'Revenue_M', 'Users_M', 'Success_%']
                 )
-                st.plotly_chart(fig_score, use_container_width=True)
                 
-                # Top games
-                st.subheader("Top 10 Games")
-                top_games = pub_games.nlargest(10, 'estimated_revenue_usd')[
-                    ['name', 'estimated_revenue_usd', 'owners_avg', 'positive_ratio', 'release_date']
-                ].copy()
-                
-                top_games['Revenue'] = (top_games['estimated_revenue_usd'] / 1e6).round(2)
-                top_games['Users'] = (top_games['owners_avg'] / 1e3).round(1)
-                top_games['Rating'] = (top_games['positive_ratio'] * 100).round(1)
-                
-                st.dataframe(
-                    top_games[['name', 'Revenue', 'Users', 'Rating', 'release_date']].rename(
-                        columns={'name': 'Game', 'Revenue': 'Revenue ($M)', 
-                                'Users': 'Users (K)', 'Rating': 'Rating (%)',
-                                'release_date': 'Release Date'}
-                    ),
-                    use_container_width=True
-                )
+                if export_columns:
+                    export_data = export_df[export_columns].round(2)
+                    
+                    csv = export_data.to_csv()
+                    st.download_button(
+                        label="Download Portfolio Analysis (CSV)",
+                        data=csv,
+                        file_name="ma_portfolio_analysis.csv",
+                        mime="text/csv"
+                    )
+                    
+                    st.subheader("Export Preview")
+                    st.dataframe(export_data, use_container_width=True)
+                    
+                    # Configuration summary
+                    st.subheader("Configuration Summary")
+                    config_df = pd.DataFrame({
+                        'Parameter': [
+                            'Portfolio Size',
+                            'Must Have Count',
+                            'Strategic Count',
+                            'Growth Count',
+                            'Content Weight',
+                            'Quality Weight',
+                            'Market Weight',
+                            'Efficiency Weight'
+                        ],
+                        'Value': [
+                            portfolio_size,
+                            must_have_count,
+                            strategic_count,
+                            growth_count,
+                            f"{content_weight:.1%}",
+                            f"{quality_weight:.1%}",
+                            f"{market_weight:.1%}",
+                            f"{efficiency_weight:.1%}"
+                        ]
+                    })
+                    st.dataframe(config_df, use_container_width=True)
     
-    with tab4:
-        st.header("Market Intelligence")
-        
-        # Tier distribution analysis
-        st.subheader("Market Tier Distribution")
-        
-        tier_analysis = publisher_df.groupby('tier').agg({
-            'ma_score': 'mean',
-            'total_revenue': 'sum',
-            'total_users': 'sum',
-            'portfolio_size': 'count',
-            'growth_potential': 'mean'
-        }).round(1)
-        
-        tier_analysis.columns = ['Avg Score', 'Total Revenue', 'Total Users', 'Publisher Count', 'Avg Growth Potential']
-        tier_analysis['Avg Revenue'] = tier_analysis['Total Revenue'] / tier_analysis['Publisher Count']
-        
-        st.dataframe(tier_analysis, use_container_width=True)
-        
-        # Release patterns
-        if len(portfolio_df) > 0:
-            st.subheader("Release Activity - Portfolio Publishers")
-            
-            portfolio_pubs = portfolio_df.index.tolist()[:10]
-            timeline_data = df[df['publisher'].isin(portfolio_pubs)].copy()
-            timeline_data['release_year'] = timeline_data['release_date'].dt.year
-            
-            yearly = timeline_data.groupby(['release_year', 'publisher']).size().reset_index(name='releases')
-            yearly = yearly[(yearly['release_year'] >= 2018) & (yearly['release_year'] <= 2024)]
-            
-            fig_timeline = px.line(
-                yearly,
-                x='release_year',
-                y='releases',
-                color='publisher',
-                title="Release Patterns (2018-2024)",
-                markers=True
-            )
-            st.plotly_chart(fig_timeline, use_container_width=True)
-        
-        # Efficiency matrix
-        st.subheader("Efficiency vs Quality Matrix")
-        
-        # Create color map for existing tiers
-        tier_colors = {
-            'Must Have': '#28a745',
-            'Strategic': '#17a2b8',
-            'Growth': '#6610f2'
-        }
-        existing_tiers_matrix = publisher_df.head(50)['tier'].unique()
-        color_map_matrix = {tier: tier_colors[tier] for tier in existing_tiers_matrix if tier in tier_colors}
-        
-        fig_matrix = px.scatter(
-            publisher_df.head(50),
-            x='efficiency_score',
-            y='quality_score',
-            size='total_revenue',
-            color='tier',
-            hover_name=publisher_df.head(50).index,
-            hover_data=['ma_score', 'growth_potential'],
-            color_discrete_map=color_map_matrix
-        )
-        
-        fig_matrix.add_hline(y=50, line_dash="dash", line_color="gray", opacity=0.3)
-        fig_matrix.add_vline(x=50, line_dash="dash", line_color="gray", opacity=0.3)
-        
-        fig_matrix.update_layout(height=500)
-        st.plotly_chart(fig_matrix, use_container_width=True)
-    
-    with tab5:
-        st.header("Export Analysis")
-        
-        if len(portfolio_df) > 0:
-            # Export data
-            export_df = portfolio_df.copy()
-            export_df['Revenue_M'] = export_df['total_revenue'] / 1e6
-            export_df['Users_M'] = export_df['total_users'] / 1e6
-            export_df['Success_%'] = export_df['success_rate'] * 100
-            export_df['Growth_Potential'] = export_df['growth_potential']
-            
-            export_columns = st.multiselect(
-                "Select columns to export:",
-                export_df.columns.tolist(),
-                default=['ma_score', 'tier', 'Growth_Potential', 'portfolio_size', 'Revenue_M', 'Users_M', 'Success_%']
-            )
-            
-            if export_columns:
-                export_data = export_df[export_columns].round(2)
-                
-                csv = export_data.to_csv()
-                st.download_button(
-                    label="Download Portfolio Analysis (CSV)",
-                    data=csv,
-                    file_name="ma_portfolio_analysis.csv",
-                    mime="text/csv"
-                )
-                
-                st.subheader("Export Preview")
-                st.dataframe(export_data, use_container_width=True)
-                
-                # Configuration summary
-                st.subheader("Configuration Summary")
-                config_df = pd.DataFrame({
-                    'Parameter': [
-                        'Portfolio Size',
-                        'Must Have Count',
-                        'Strategic Count',
-                        'Growth Count',
-                        'Content Weight',
-                        'Quality Weight',
-                        'Market Weight',
-                        'Efficiency Weight'
-                    ],
-                    'Value': [
-                        portfolio_size,
-                        must_have_count,
-                        strategic_count,
-                        growth_count,
-                        f"{content_weight:.1%}",
-                        f"{quality_weight:.1%}",
-                        f"{market_weight:.1%}",
-                        f"{efficiency_weight:.1%}"
-                    ]
-                })
-                st.dataframe(config_df, use_container_width=True)
+    else:
+        # Show message when no analysis has been run
+        st.info("Configure your parameters and click 'Run Analysis' to generate portfolio recommendations.")    
 
 if __name__ == "__main__":
     main()

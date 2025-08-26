@@ -1,4 +1,8 @@
 # assignment-fs
+
+Slides:
+https://docs.google.com/presentation/d/1L6se6_fbHI7norV-QgWYeJO89GFDdNo64ERgL1WbPJc/edit?usp=sharing
+
 Steam Games Data Processing Pipeline - README
 Overview
 This repository contains a comprehensive data processing pipeline for Steam games data, consisting of two main Python scripts that clean, transform, and analyze a large-scale dataset of 140,082 Steam games with associated metadata from 8 different data sources.

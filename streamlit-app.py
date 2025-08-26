@@ -75,13 +75,23 @@ def load_data():
     return df
 
 def calculate_publisher_metrics(df, weights):
-    """Calculate comprehensive publisher metrics with custom weights"""
+    """Calculate comprehensive publisher metrics with custom weights and tier-specific bonuses"""
     
     # Filter valid publishers with minimum viability thresholds
     df_clean = df[
         (df['publisher'].notna()) & 
         (df['publisher'] != 'Unknown')
     ].copy()
+    
+    # Handle multi-publisher entries systematically
+    # For games with multiple publishers (comma-separated), take the first one as primary
+    # This handles cases like "FromSoftware, Inc., Bandai Namco Entertainment"
+    if df_clean['publisher'].str.contains(',').any():
+        # Option 1: Take first publisher as primary
+        df_clean['publisher'] = df_clean['publisher'].str.split(',').str[0].str.strip()
+        
+        # Option 2: If you want to keep both relationships, you could expand rows instead
+        # But for M&A analysis, we typically want the primary publisher
     
     # Pre-calculate publisher totals for filtering
     publisher_stats = df_clean.groupby('publisher').agg({
@@ -157,7 +167,11 @@ def calculate_publisher_metrics(df, weights):
     publisher_df['recent_releases'] = recent_releases.reindex(publisher_df.index, fill_value=0)
     publisher_df['release_cadence'] = publisher_df['recent_releases'] / 3
     
-    # Calculate max values for normalization (use actual max, not percentiles)
+    # Recent quality metrics (for Growth tier)
+    recent_quality = df_clean[recent_mask].groupby('publisher')['positive_ratio'].mean()
+    publisher_df['recent_avg_rating'] = recent_quality.reindex(publisher_df.index, fill_value=0)
+    
+    # Calculate max values for normalization
     max_vals = {
         'portfolio': max(publisher_df['portfolio_size'].max(), 1),
         'revenue': max(publisher_df['total_revenue'].max(), 1),
@@ -169,7 +183,7 @@ def calculate_publisher_metrics(df, weights):
     
     max_cadence = max(publisher_df['release_cadence'].max(), 1)
     
-    # Component scores (back to original formula but with better base scores)
+    # Calculate component scores using USER-DEFINED WEIGHTS
     publisher_df['content_score'] = (
         (publisher_df['release_cadence'] / max_cadence) * weights['release_cadence'] +
         (publisher_df['portfolio_size'] / max_vals['portfolio']) * weights['portfolio_size'] +
@@ -194,7 +208,7 @@ def calculate_publisher_metrics(df, weights):
         (publisher_df['users_per_game'] / max_vals['upg']) * weights['user_efficiency']
     ) * 100
     
-    # Growth potential
+    # Growth potential (for reference)
     publisher_df['growth_potential'] = (
         (publisher_df['release_cadence'] / max_cadence) * 0.3 +
         publisher_df['success_rate'] * 0.3 +
@@ -202,27 +216,27 @@ def calculate_publisher_metrics(df, weights):
         (1 - publisher_df['zombie_rate']) * 0.2
     ) * 100
     
-    # Base M&A score
-    publisher_df['ma_score'] = (
+    # BASE M&A SCORE using user-defined weights
+    publisher_df['base_ma_score'] = (
         publisher_df['content_score'] * weights['content_weight'] +
         publisher_df['quality_score'] * weights['quality_weight'] +
         publisher_df['market_score'] * weights['market_weight'] +
         publisher_df['efficiency_score'] * weights['efficiency_weight']
     )
     
-    # Apply significant bonuses for scale
+    # CALCULATE TIER-SPECIFIC BONUS SCORES
+    # Must Have Bonus: Extra points for scale
+    publisher_df['must_have_bonus'] = 0
     for idx in publisher_df.index:
         bonus = 0
-        
-        # Major user bonuses
+        # Massive scale bonuses
         if publisher_df.loc[idx, 'total_users'] > 200_000_000:
-            bonus = 40
+            bonus += 40
         elif publisher_df.loc[idx, 'total_users'] > 100_000_000:
-            bonus = 30
+            bonus += 30
         elif publisher_df.loc[idx, 'total_users'] > 50_000_000:
-            bonus = 20
+            bonus += 20
         
-        # Major revenue bonuses
         if publisher_df.loc[idx, 'total_revenue'] > 10_000_000_000:
             bonus = max(bonus, 40)
         elif publisher_df.loc[idx, 'total_revenue'] > 3_000_000_000:
@@ -230,29 +244,115 @@ def calculate_publisher_metrics(df, weights):
         elif publisher_df.loc[idx, 'total_revenue'] > 1_000_000_000:
             bonus = max(bonus, 20)
         
-        publisher_df.loc[idx, 'ma_score'] += bonus
+        publisher_df.loc[idx, 'must_have_bonus'] = bonus
+    
+    # Strategic Bonus: Extra points for profitability/efficiency
+    publisher_df['strategic_bonus'] = 0
+    for idx in publisher_df.index:
+        bonus = 0
+        # High profitability bonuses
+        if publisher_df.loc[idx, 'revenue_per_game'] > 100_000_000:
+            bonus += 25
+        elif publisher_df.loc[idx, 'revenue_per_game'] > 50_000_000:
+            bonus += 20
+        elif publisher_df.loc[idx, 'revenue_per_game'] > 25_000_000:
+            bonus += 15
+        
+        # Success rate bonuses
+        if publisher_df.loc[idx, 'success_rate'] > 0.7:
+            bonus += 20
+        elif publisher_df.loc[idx, 'success_rate'] > 0.5:
+            bonus += 15
+        elif publisher_df.loc[idx, 'success_rate'] > 0.3:
+            bonus += 10
+        
+        # Niche dominance (small portfolio but high revenue)
+        if publisher_df.loc[idx, 'portfolio_size'] < 10 and publisher_df.loc[idx, 'revenue_per_game'] > 30_000_000:
+            bonus += 15
+        
+        publisher_df.loc[idx, 'strategic_bonus'] = bonus
+    
+    # Growth Bonus: Extra points for momentum and recent quality
+    publisher_df['growth_bonus'] = 0
+    for idx in publisher_df.index:
+        bonus = 0
+        # Recent positive reviews bonus
+        if publisher_df.loc[idx, 'recent_avg_rating'] > 0.85:
+            bonus += 25
+        elif publisher_df.loc[idx, 'recent_avg_rating'] > 0.75:
+            bonus += 20
+        elif publisher_df.loc[idx, 'recent_avg_rating'] > 0.65:
+            bonus += 15
+        
+        # Release momentum bonus
+        if publisher_df.loc[idx, 'release_cadence'] > 3:
+            bonus += 20
+        elif publisher_df.loc[idx, 'release_cadence'] > 2:
+            bonus += 15
+        elif publisher_df.loc[idx, 'release_cadence'] > 1:
+            bonus += 10
+        
+        # Hidden gem bonus (high quality, low revenue - opportunity)
+        if publisher_df.loc[idx, 'avg_rating'] > 0.8 and publisher_df.loc[idx, 'total_revenue'] < 100_000_000:
+            bonus += 15
+        
+        publisher_df.loc[idx, 'growth_bonus'] = bonus
+    
+    # Calculate three tier-specific M&A scores
+    publisher_df['ma_score_must_have'] = publisher_df['base_ma_score'] + publisher_df['must_have_bonus']
+    publisher_df['ma_score_strategic'] = publisher_df['base_ma_score'] + publisher_df['strategic_bonus']
+    publisher_df['ma_score_growth'] = publisher_df['base_ma_score'] + publisher_df['growth_bonus']
+    
+    # ASSIGN TIERS based on which category they rank highest in
+    # First, rank publishers in each category
+    publisher_df['rank_must_have'] = publisher_df['ma_score_must_have'].rank(ascending=False, method='min')
+    publisher_df['rank_strategic'] = publisher_df['ma_score_strategic'].rank(ascending=False, method='min')
+    publisher_df['rank_growth'] = publisher_df['ma_score_growth'].rank(ascending=False, method='min')
+    
+    # Assign tier based on best ranking position
+    def assign_tier(row):
+        # Force tier for obvious cases
+        if row['total_revenue'] > 5_000_000_000 or row['total_users'] > 200_000_000:
+            return 'Must Have'
+        
+        # Check which category they rank best in
+        ranks = {
+            'Must Have': row['rank_must_have'],
+            'Strategic': row['rank_strategic'],
+            'Growth': row['rank_growth']
+        }
+        
+        # Assign to category where they rank highest
+        best_tier = min(ranks, key=ranks.get)
+        
+        # Apply thresholds to ensure quality
+        if best_tier == 'Must Have' and row['ma_score_must_have'] < 30:
+            best_tier = 'Strategic'
+        if best_tier == 'Strategic' and row['ma_score_strategic'] < 25:
+            best_tier = 'Growth'
+        
+        return best_tier
+    
+    publisher_df['tier'] = publisher_df.apply(assign_tier, axis=1)
+    
+    # Set final M&A score based on assigned tier
+    def get_final_score(row):
+        if row['tier'] == 'Must Have':
+            return row['ma_score_must_have']
+        elif row['tier'] == 'Strategic':
+            return row['ma_score_strategic']
+        else:
+            return row['ma_score_growth']
+    
+    publisher_df['ma_score'] = publisher_df.apply(get_final_score, axis=1)
     
     # Ensure minimum viable score
     publisher_df['ma_score'] = publisher_df['ma_score'].clip(lower=0)
     
-    # Sort by score
+    # Sort by M&A score
     publisher_df = publisher_df.sort_values('ma_score', ascending=False)
     
-    # Assign tiers
-    publisher_df['tier'] = 'Growth'
-    
-    if len(publisher_df) >= 3:
-        n_must_have = max(1, int(len(publisher_df) * 0.2))
-        n_strategic = max(1, int(len(publisher_df) * 0.3))
-        
-        publisher_df.iloc[:n_must_have, publisher_df.columns.get_loc('tier')] = 'Must Have'
-        publisher_df.iloc[n_must_have:n_must_have+n_strategic, publisher_df.columns.get_loc('tier')] = 'Strategic'
-    elif len(publisher_df) == 2:
-        publisher_df.iloc[0, publisher_df.columns.get_loc('tier')] = 'Must Have'
-        publisher_df.iloc[1, publisher_df.columns.get_loc('tier')] = 'Strategic'
-    elif len(publisher_df) == 1:
-        publisher_df.iloc[0, publisher_df.columns.get_loc('tier')] = 'Must Have'
-    
+    # Convert tier to categorical for proper ordering
     publisher_df['tier'] = pd.Categorical(
         publisher_df['tier'], 
         categories=['Growth', 'Strategic', 'Must Have'], 

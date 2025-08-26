@@ -138,7 +138,7 @@ def calculate_publisher_metrics(df, weights):
     publisher_df['recent_releases'] = recent_releases.reindex(publisher_df.index, fill_value=0)
     publisher_df['release_cadence'] = publisher_df['recent_releases'] / 3
     
-    # Growth potential score (important for Tier 3)
+    # Growth potential score
     publisher_df['growth_potential'] = (
         publisher_df['release_cadence'] * 0.3 +
         publisher_df['success_rate'] * 0.3 +
@@ -188,21 +188,36 @@ def calculate_publisher_metrics(df, weights):
         publisher_df['efficiency_score'] * weights['efficiency_weight']
     )
     
-    # Assign tiers - FIXED naming
-    # Must Have: Top performers (>70 score)
-    # Strategic: Mid-tier filling gaps (50-70 score)  
-    # Growth: High potential smaller publishers
-    publisher_df['tier'] = pd.cut(
-        publisher_df['ma_score'],
-        bins=[0, 50, 70, 100],
-        labels=['Growth', 'Strategic', 'Must Have']
+    # Sort by score first
+    publisher_df = publisher_df.sort_values('ma_score', ascending=False)
+    
+    # Assign tiers manually to ensure all categories exist
+    publisher_df['tier'] = 'Growth'  # Default
+    
+    # Assign based on percentiles to ensure all tiers exist
+    if len(publisher_df) >= 3:
+        # Top 20% or at least 1 = Must Have
+        n_must_have = max(1, int(len(publisher_df) * 0.2))
+        # Next 30% or at least 1 = Strategic  
+        n_strategic = max(1, int(len(publisher_df) * 0.3))
+        
+        publisher_df.iloc[:n_must_have, publisher_df.columns.get_loc('tier')] = 'Must Have'
+        publisher_df.iloc[n_must_have:n_must_have+n_strategic, publisher_df.columns.get_loc('tier')] = 'Strategic'
+        # Rest remain as Growth
+    elif len(publisher_df) == 2:
+        publisher_df.iloc[0, publisher_df.columns.get_loc('tier')] = 'Must Have'
+        publisher_df.iloc[1, publisher_df.columns.get_loc('tier')] = 'Strategic'
+    elif len(publisher_df) == 1:
+        publisher_df.iloc[0, publisher_df.columns.get_loc('tier')] = 'Must Have'
+    
+    # Convert to categorical for proper ordering
+    publisher_df['tier'] = pd.Categorical(
+        publisher_df['tier'], 
+        categories=['Growth', 'Strategic', 'Must Have'], 
+        ordered=True
     )
     
-    # Override for high growth potential publishers
-    high_growth = (publisher_df['growth_potential'] > 60) & (publisher_df['portfolio_size'] < 20)
-    publisher_df.loc[high_growth & (publisher_df['tier'] != 'Must Have'), 'tier'] = 'Growth'
-    
-    return publisher_df.sort_values('ma_score', ascending=False)
+    return publisher_df
 
 def build_portfolio(publisher_df, composition, portfolio_size):
     """Build a portfolio based on user-defined tier composition"""
@@ -555,78 +570,91 @@ def main():
             st.subheader("Portfolio Tier Distribution")
             
             tier_data = portfolio_df['tier'].value_counts()
-            fig_tier = px.pie(
-                values=tier_data.values,
-                names=tier_data.index,
-                color_discrete_map={
-                    'Must Have': '#28a745',
-                    'Strategic': '#17a2b8',
-                    'Growth': '#6610f2'
-                }
-            )
-            st.plotly_chart(fig_tier, use_container_width=True)
-    
-    with tab2:
-        st.header("Comparative Analysis")
-        
-        # Scatter plot
-        fig_scatter = px.scatter(
-            publisher_df.head(100),
-            x='total_revenue',
-            y='total_users',
-            size='portfolio_size',
-            color='tier',
-            hover_data=['ma_score', 'success_rate', 'growth_potential'],
-            labels={
-                'total_revenue': 'Total Revenue ($)',
-                'total_users': 'Total Users'
-            },
-            title="Publisher Landscape (Top 100)",
-            color_discrete_map={
+            
+            # Create color map only for existing tiers
+            tier_colors = {
                 'Must Have': '#28a745',
                 'Strategic': '#17a2b8',
                 'Growth': '#6610f2'
             }
-        )
-        
-        # Highlight portfolio
-        if len(portfolio_df) > 0:
-            fig_scatter.add_scatter(
-                x=portfolio_df['total_revenue'],
-                y=portfolio_df['total_users'],
-                mode='markers',
-                marker=dict(size=20, color='red', symbol='star'),
-                name='Selected Portfolio',
-                showlegend=True
+            existing_tiers_pie = tier_data.index.tolist()
+            color_map_pie = {tier: tier_colors[tier] for tier in existing_tiers_pie if tier in tier_colors}
+            
+            fig_tier = px.pie(
+                values=tier_data.values,
+                names=tier_data.index,
+                color_discrete_map=color_map_pie
             )
-        
-        fig_scatter.update_layout(height=500)
-        st.plotly_chart(fig_scatter, use_container_width=True)
-        
-        # Component comparison
-        if len(portfolio_df) > 0:
-            st.subheader("Component Score Analysis")
-            
-            components = ['content_score', 'quality_score', 'market_score', 'efficiency_score']
-            
-            # Portfolio average vs market average
-            portfolio_avg = portfolio_df[components].mean()
-            market_avg = publisher_df.head(100)[components].mean()
-            
-            comparison_df = pd.DataFrame({
-                'Portfolio': portfolio_avg,
-                'Market Top 100': market_avg
-            }).T
-            
-            fig_comp = px.bar(
-                comparison_df,
-                barmode='group',
-                title="Portfolio vs Market Average Scores",
-                labels={'value': 'Score', 'index': 'Metric'},
-                color_discrete_sequence=['#0066cc', '#cccccc']
-            )
-            st.plotly_chart(fig_comp, use_container_width=True)
+            st.plotly_chart(fig_tier, use_container_width=True)
     
+    with tab2:
+            st.header("Comparative Analysis")
+            
+            # Prepare color mapping based on what tiers actually exist in the data
+            tier_colors = {
+                'Must Have': '#28a745',
+                'Strategic': '#17a2b8',
+                'Growth': '#6610f2'
+            }
+            
+            # Only include colors for tiers that exist in the data
+            existing_tiers = publisher_df.head(100)['tier'].unique()
+            color_map = {tier: tier_colors[tier] for tier in existing_tiers if tier in tier_colors}
+            
+            # Scatter plot
+            fig_scatter = px.scatter(
+                publisher_df.head(100),
+                x='total_revenue',
+                y='total_users',
+                size='portfolio_size',
+                color='tier',
+                hover_data=['ma_score', 'success_rate', 'growth_potential'],
+                labels={
+                    'total_revenue': 'Total Revenue ($)',
+                    'total_users': 'Total Users'
+                },
+                title="Publisher Landscape (Top 100)",
+                color_discrete_map=color_map  # Use the filtered color map
+            )
+            
+            # Highlight portfolio
+            if len(portfolio_df) > 0:
+                fig_scatter.add_scatter(
+                    x=portfolio_df['total_revenue'],
+                    y=portfolio_df['total_users'],
+                    mode='markers',
+                    marker=dict(size=20, color='red', symbol='star'),
+                    name='Selected Portfolio',
+                    showlegend=True
+                )
+            
+            fig_scatter.update_layout(height=500)
+            st.plotly_chart(fig_scatter, use_container_width=True)
+            
+            # Component comparison
+            if len(portfolio_df) > 0:
+                st.subheader("Component Score Analysis")
+                
+                components = ['content_score', 'quality_score', 'market_score', 'efficiency_score']
+                
+                # Portfolio average vs market average
+                portfolio_avg = portfolio_df[components].mean()
+                market_avg = publisher_df.head(100)[components].mean()
+                
+                comparison_df = pd.DataFrame({
+                    'Portfolio': portfolio_avg,
+                    'Market Top 100': market_avg
+                }).T
+                
+                fig_comp = px.bar(
+                    comparison_df,
+                    barmode='group',
+                    title="Portfolio vs Market Average Scores",
+                    labels={'value': 'Score', 'index': 'Metric'},
+                    color_discrete_sequence=['#0066cc', '#cccccc']
+                )
+                st.plotly_chart(fig_comp, use_container_width=True)
+        
     with tab3:
         st.header("Publisher Deep Dive")
         
@@ -751,6 +779,15 @@ def main():
         # Efficiency matrix
         st.subheader("Efficiency vs Quality Matrix")
         
+        # Create color map for existing tiers
+        tier_colors = {
+            'Must Have': '#28a745',
+            'Strategic': '#17a2b8',
+            'Growth': '#6610f2'
+        }
+        existing_tiers_matrix = publisher_df.head(50)['tier'].unique()
+        color_map_matrix = {tier: tier_colors[tier] for tier in existing_tiers_matrix if tier in tier_colors}
+        
         fig_matrix = px.scatter(
             publisher_df.head(50),
             x='efficiency_score',
@@ -759,11 +796,7 @@ def main():
             color='tier',
             hover_name=publisher_df.head(50).index,
             hover_data=['ma_score', 'growth_potential'],
-            color_discrete_map={
-                'Must Have': '#28a745',
-                'Strategic': '#17a2b8',
-                'Growth': '#6610f2'
-            }
+            color_discrete_map=color_map_matrix
         )
         
         fig_matrix.add_hline(y=50, line_dash="dash", line_color="gray", opacity=0.3)
